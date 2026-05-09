@@ -9,7 +9,7 @@
   <author>UrbanStorage</author>
   <namespace>UrbanDuplicati</namespace>
   <category>tools</category>
-  <dependencies><nextcloud min-version="25" max-version="32"/></dependencies>
+  <dependencies><nextcloud min-version="25" max-version="33"/></dependencies>
   <navigations><navigation><name>Dupli</name><route>urbanduplicati.page.index</route><order>98</order></navigation></navigations>
   <settings><admin>OCA\\UrbanDuplicati\\Settings\\Admin</admin></settings>
 </info>
