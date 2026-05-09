@@ -20,7 +20,7 @@ class NotificationController extends Controller {
      */
     public function scanFinished(int $taskId): JSONResponse {
         $secret = $this->request->getParam("secret", "");
-        $stored = \OC::$server->getConfig()->getAppValue("urbanduplicati", "internal_secret", "");
+        $stored = \OCP\Server::get(\OCP\IConfig::class)->getAppValue("urbanduplicati", "internal_secret", "");
         if (empty($stored) || $secret !== $stored) return new JSONResponse(["error" => "Unauthorized"], 401);
         $task = $this->db->fetchOne("SELECT * FROM oc_ud_tasks WHERE id = ?", [$taskId]);
         if (!$task) return new JSONResponse(["error" => "Task not found"], 404);

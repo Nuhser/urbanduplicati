@@ -14,6 +14,5 @@ class Application extends App implements IBootstrap {
         $context->registerNotifierService(Notifier::class);
     }
     public function boot(IBootContext $context): void {
-        require_once \OC_App::getAppPath(self::APP_ID) . "/vendor/autoload.php";
     }
 }

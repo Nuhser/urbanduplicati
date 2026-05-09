@@ -131,10 +131,11 @@ class TaskController extends Controller {
         );
         $taskId = $this->db->lastInsertId('oc_ud_tasks');
 
-        $appDir     = \OC_App::getAppPath('urbanduplicati');
+        $appDir     = dirname(dirname(__DIR__));
         $serverRoot = \OC::$SERVERROOT;
-        $dataDir    = \OC::$server->getConfig()->getSystemValue('datadirectory', '/var/www/html/data');
-        $instanceId = \OC::$server->getConfig()->getSystemValue('instanceid', '');
+        $config     = \OCP\Server::get(\OCP\IConfig::class);
+        $dataDir    = $config->getSystemValue('datadirectory', '/var/www/html/data');
+        $instanceId = $config->getSystemValue('instanceid', '');
         $logDir     = $dataDir . '/appdata_' . $instanceId . '/urbanduplicati/logs';
         @mkdir($logDir, 0750, true);
         $logFile = $logDir . '/' . date('d-m-Y_H-i-s') . '_task' . $taskId . '.log';
