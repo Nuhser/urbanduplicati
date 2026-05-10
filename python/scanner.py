@@ -334,7 +334,7 @@ def run_task(task_id: int):
         # Send Nextcloud notification if enabled
         try:
             secret = db.get_app_value('urbanduplicati', 'internal_secret', '')
-            base_url = db.get_config().get('base_url', 'http://localhost')
+            base_url = 'http://localhost'  # always use internal URL; overwrite.cli.url is the external Cloudflare URL
             if secret:
                 url = base_url.rstrip('/') + '/index.php/apps/urbanduplicati/api/v1/notify/' + str(task_id)
                 data = urllib.parse.urlencode({'secret': secret}).encode()
