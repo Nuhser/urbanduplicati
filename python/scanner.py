@@ -8,6 +8,13 @@ import urllib.request
 import urllib.parse
 import logging
 from PIL import Image, ImageOps
+import PIL
+PIL.Image.MAX_IMAGE_PIXELS = 300_000_000
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass
 import imagehash
 import db
 
