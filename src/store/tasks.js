@@ -90,34 +90,54 @@ const actions = {
   async deleteFile({ dispatch }, { taskId, groupId, fileId }) {
     try {
       await axios.delete(generateUrl(`/apps/urbanduplicati/api/v1/tasks/${taskId}/groups/${groupId}/files/${fileId}`))
-      await dispatch('getGroups', taskId)
       showSuccess('File deleted')
     } catch(e) { showError('Failed to delete file') }
   },
-  async bulkDelete({ commit }, { taskId, groupIds, deleteProtectedFor = [], deleteUnprotectedAndKeepOne = false, keepFromFolder = '', filterPattern = '', onProgress = null }) {
+  async bulkDelete({ commit }, { taskId, groupIds, deleteProtectedFor = [], deleteUnprotectedAndKeepOne = false, keepFromFolder = '', filterPattern = '', onProgress = null, shouldStop = null }) {
     try {
-      const BATCH_SIZE = 20
+      const BATCH_SIZE = 1
       let totalDeleted = 0
       let totalSkipped = 0
+      let allConflicts = []
+
       for (let i = 0; i < groupIds.length; i += BATCH_SIZE) {
+        // Check stop flag before each batch
+        if (shouldStop && shouldStop()) break
+
         const batch = groupIds.slice(i, i + BATCH_SIZE)
-        const res = await axios.post(generateUrl(`/apps/urbanduplicati/api/v1/tasks/${taskId}/bulk-delete`), {
-          group_ids: JSON.stringify(batch),
-          delete_protected_for: JSON.stringify(deleteProtectedFor),
-          delete_unprotected_keep_one: deleteUnprotectedAndKeepOne,
-          keep_from_folder: keepFromFolder,
-          filter_pattern: filterPattern,
-        })
-        if (res.data) {
-          totalDeleted += res.data.deleted || 0
-          totalSkipped += res.data.skipped || 0
+        try {
+          const res = await axios.post(generateUrl(`/apps/urbanduplicati/api/v1/tasks/${taskId}/bulk-delete`), {
+            group_ids: JSON.stringify(batch),
+            delete_protected_for: JSON.stringify(deleteProtectedFor),
+            delete_unprotected_keep_one: deleteUnprotectedAndKeepOne,
+            keep_from_folder: keepFromFolder,
+            filter_pattern: filterPattern,
+          })
+          if (res.data) {
+            totalDeleted += res.data.deleted || 0
+            totalSkipped += res.data.skipped || 0
+            if (res.data.conflicts && res.data.conflicts.length > 0) {
+              allConflicts = allConflicts.concat(res.data.conflicts)
+            }
+          }
+        } catch (batchErr) {
+          // Log but continue — don't let one slow/failed batch abort the whole operation
+          console.warn('Batch failed, skipping:', batch, batchErr)
+          totalSkipped += batch.length
         }
-        if (onProgress) onProgress(Math.min(i + BATCH_SIZE, groupIds.length), groupIds.length, totalDeleted)
+        try {
+          if (onProgress) onProgress(Math.min(i + BATCH_SIZE, groupIds.length), groupIds.length, totalDeleted)
+        } catch (progressErr) {
+          console.warn('onProgress error (ignored):', progressErr)
+        }
       }
       commit('clearSelection')
       showSuccess('Duplicates deleted')
-      return { success: true, deleted: totalDeleted, skipped: totalSkipped }
-    } catch(e) { showError('Bulk delete failed') }
+      return { success: true, deleted: totalDeleted, skipped: totalSkipped, conflicts: allConflicts }
+    } catch(e) {
+      console.error('bulkDelete outer error:', e && e.message, e && e.stack)
+      showError('Bulk delete failed: ' + (e && e.message ? e.message : 'unknown error'))
+    }
   },
   async bulkRemove({ dispatch, commit }, { taskId, groupIds }) {
     try {

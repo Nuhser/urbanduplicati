@@ -307,6 +307,9 @@ class TaskController extends Controller {
     }
 
     /**
+     * Delete a single file.
+     * Pass ?force_delete=1 to bypass protection check (used by conflict resolution).
+     *
      * @NoAdminRequired
      */
     public function deleteFile(int $id, int $groupId, int $fileId): JSONResponse {
@@ -319,9 +322,23 @@ class TaskController extends Controller {
         );
         if (!$file) return new JSONResponse(['error' => 'Not found'], 404);
 
+        $forceDelete = filter_var($this->request->getParam('force_delete', false), FILTER_VALIDATE_BOOLEAN);
         $rules = $this->getProtectionRules();
-        if ($this->isProtected($file, $rules)) {
+        if (!$forceDelete && $this->isProtected($file, $rules)) {
             return new JSONResponse(['error' => 'File is protected'], 403);
+        }
+
+        // Bypass trash bin so large files are permanently deleted, not slowly copied to trash
+        if (class_exists('\OCA\Files_Trashbin\Events\MoveToTrashEvent')) {
+            try {
+                $dispatcher = \OC::$server->get(\OCP\EventDispatcher\IEventDispatcher::class);
+                $dispatcher->addListener(
+                    \OCA\Files_Trashbin\Events\MoveToTrashEvent::class,
+                    static function (\OCA\Files_Trashbin\Events\MoveToTrashEvent $event): void {
+                        $event->disableTrashBin();
+                    }
+                );
+            } catch (\Exception $e) { /* non-fatal */ }
         }
 
         try {
@@ -353,17 +370,46 @@ class TaskController extends Controller {
     }
 
     /**
-     * Bulk delete:
-     * - Keep ALL protected files always
-     * - Delete ALL unprotected files in the group (none are kept from unprotected)
-     * - If deleteProtectedDuplicates=true for specific groups, also delete all-but-one protected files
+     * Bulk delete with new rules:
+     *
+     * Rule 1 — All-unprotected group:
+     *   Keep the LARGEST file (by filesize), delete all others.
+     *
+     * Rule 2 — Mixed group (has protected + unprotected):
+     *   Delete ALL unprotected files. Keep ALL protected files.
+     *
+     * Rule 3 — "Delete all but one protected copy" opt-in (deleteProtectedFor):
+     *   Keep the single LARGEST protected file, delete ALL others
+     *   (all unprotected + all smaller protected files).
+     *
+     * Rule 4 — Conflict detection (only when Rule 3 applies):
+     *   If largest unprotected > largest protected → skip that group,
+     *   include it in the returned 'conflicts' array for frontend resolution.
      *
      * @NoAdminRequired
      */
     public function bulkDelete(int $id): JSONResponse {
         try {
+        // No execution time limit — large video files can take a long time to delete
+        set_time_limit(0);
+
+        // Bypass trash bin for all deletes in this request.
+        // Without this, the trash bin tries to COPY each file before deleting,
+        // causing 100+ second timeouts for large videos (Cloudflare 524) and failures.
+        // Bulk-deleted duplicates are permanently deleted — they've already been reviewed.
+        if (class_exists('\OCA\Files_Trashbin\Events\MoveToTrashEvent')) {
+            try {
+                $dispatcher = \OC::$server->get(\OCP\EventDispatcher\IEventDispatcher::class);
+                $dispatcher->addListener(
+                    \OCA\Files_Trashbin\Events\MoveToTrashEvent::class,
+                    static function (\OCA\Files_Trashbin\Events\MoveToTrashEvent $event): void {
+                        $event->disableTrashBin();
+                    }
+                );
+            } catch (\Exception $e) { /* non-fatal: trash may still be used */ }
+        }
+
         $raw = $this->request->getParam('group_ids', '[]'); $groupIds = is_array($raw) ? $raw : (json_decode($raw, true) ?? []);
-        // Optional: list of group IDs where user chose to also delete protected duplicates (keep one)
         $rawProt = $this->request->getParam('delete_protected_for', '[]'); $deleteProtectedFor = is_array($rawProt) ? $rawProt : (json_decode($rawProt, true) ?? []);
         $deleteUnprotectedKeepOne = (bool)$this->request->getParam('delete_unprotected_keep_one', false);
         $keepFromFolder = (string)$this->request->getParam('keep_from_folder', '');
@@ -378,8 +424,9 @@ class TaskController extends Controller {
         if (!$task) return new JSONResponse(['error' => 'Not found'], 404);
 
         $rules = $this->getProtectionRules();
-        $deleted = 0;
-        $skipped = 0;
+        $deleted  = 0;
+        $skipped  = 0;
+        $conflicts = [];
 
         foreach ($groupIds as $gid) {
             $files = $this->db->fetchAll(
@@ -387,7 +434,7 @@ class TaskController extends Controller {
                 [$id, $gid]
             );
 
-            $protected   = array_values(array_filter($files, fn($f) => $this->isProtected($f, $rules)));
+            $protected   = array_values(array_filter($files, fn($f) =>  $this->isProtected($f, $rules)));
             $unprotected = array_values(array_filter($files, fn($f) => !$this->isProtected($f, $rules)));
 
             $hasFilter     = !empty($filterPattern);
@@ -402,7 +449,7 @@ class TaskController extends Controller {
             $resolvedKeep = [];
             if ($hasKeepFolder) {
                 $mounts = [];
-                try { $mounts = $this->db->fetchAll('SELECT mount_point FROM oc_external_mounts'); } catch (Exception $e) {}
+                try { $mounts = $this->db->fetchAll('SELECT mount_point FROM oc_external_mounts'); } catch (\Exception $e) {}
                 $mountPoints  = array_map(fn($m) => rtrim($m['mount_point'], '/'), $mounts);
                 $resolvedKeep = $this->resolveProtectionPath($keepFromFolder, $mountPoints);
             }
@@ -417,50 +464,98 @@ class TaskController extends Controller {
 
             $toDelete = [];
 
-            // === UNPROTECTED FILES ===
             if ($hasFilter) {
+                // ── FILTER MODE (unchanged) ────────────────────────────────
                 foreach ($unprotected as $f) {
                     if ($matchesFilter($f)) $toDelete[] = $f;
                 }
+                if ($groupOptedIn && count($protected) >= 1) {
+                    if ($hasKeepFolder) {
+                        $filterMatched    = array_values(array_filter($protected, $matchesFilter));
+                        $filterNotMatched = array_values(array_filter($protected, fn($f) => !$matchesFilter($f)));
+                        foreach ($filterMatched as $f) $toDelete[] = $f;
+                        $remainInKeep    = array_values(array_filter($filterNotMatched, $inKeepFolder));
+                        $remainNotInKeep = array_values(array_filter($filterNotMatched, fn($f) => !$inKeepFolder($f)));
+                        if (count($remainInKeep) > 0) {
+                            foreach (array_slice($remainInKeep, 1) as $f) $toDelete[] = $f;
+                            foreach ($remainNotInKeep as $f) $toDelete[] = $f;
+                        } else {
+                            foreach (array_slice($filterNotMatched, 1) as $f) $toDelete[] = $f;
+                        }
+                    } else {
+                        foreach ($protected as $f) {
+                            if ($matchesFilter($f)) $toDelete[] = $f;
+                        }
+                    }
+                }
+
             } elseif ($hasKeepFolder) {
+                // ── KEEP-FROM-FOLDER MODE (unchanged) ─────────────────────
                 $unprotInKeep    = array_values(array_filter($unprotected, $inKeepFolder));
                 $unprotNotInKeep = array_values(array_filter($unprotected, fn($f) => !$inKeepFolder($f)));
                 foreach ($unprotNotInKeep as $f) $toDelete[] = $f;
                 foreach (array_slice($unprotInKeep, 1) as $f) $toDelete[] = $f;
-            } else {
-                foreach ($unprotected as $f) $toDelete[] = $f;
-            }
 
-            // === PROTECTED FILES (only if user opted in for this group) ===
-            if ($groupOptedIn && count($protected) >= 1) {
-                if ($hasFilter && $hasKeepFolder) {
-                    // Delete protected matching filter; from remainder keep one (prefer keep folder)
-                    $filterMatched    = array_values(array_filter($protected, $matchesFilter));
-                    $filterNotMatched = array_values(array_filter($protected, fn($f) => !$matchesFilter($f)));
-                    foreach ($filterMatched as $f) $toDelete[] = $f;
-                    $remainInKeep    = array_values(array_filter($filterNotMatched, $inKeepFolder));
-                    $remainNotInKeep = array_values(array_filter($filterNotMatched, fn($f) => !$inKeepFolder($f)));
-                    if (count($remainInKeep) > 0) {
-                        foreach (array_slice($remainInKeep, 1) as $f) $toDelete[] = $f;
-                        foreach ($remainNotInKeep as $f) $toDelete[] = $f;
-                    } else {
-                        foreach (array_slice($filterNotMatched, 1) as $f) $toDelete[] = $f;
-                    }
-                } elseif ($hasFilter) {
-                    foreach ($protected as $f) {
-                        if ($matchesFilter($f)) $toDelete[] = $f;
-                    }
-                } elseif ($hasKeepFolder) {
+                if ($groupOptedIn && count($protected) >= 1) {
                     $protInKeep    = array_values(array_filter($protected, $inKeepFolder));
                     $protNotInKeep = array_values(array_filter($protected, fn($f) => !$inKeepFolder($f)));
                     foreach ($protNotInKeep as $f) $toDelete[] = $f;
                     foreach (array_slice($protInKeep, 1) as $f) $toDelete[] = $f;
+                }
+
+            } else {
+                // ── NORMAL MODE (new rules) ────────────────────────────────
+
+                if ($groupOptedIn && !empty($protected)) {
+                    // Rule 3: Keep single LARGEST protected, delete all others.
+                    // First apply Rule 4 conflict detection.
+                    $sortedProt = $protected;
+                    usort($sortedProt, fn($a, $b) => (int)$b['filesize'] - (int)$a['filesize']);
+                    $largestProt = $sortedProt[0];
+
+                    if (!empty($unprotected)) {
+                        $sortedUnprot = $unprotected;
+                        usort($sortedUnprot, fn($a, $b) => (int)$b['filesize'] - (int)$a['filesize']);
+                        $largestUnprot = $sortedUnprot[0];
+
+                        if ((int)$largestUnprot['filesize'] > (int)$largestProt['filesize']) {
+                            // Rule 4: CONFLICT — skip this group, report to frontend
+                            $conflicts[] = [
+                                'group_id' => (int)$gid,
+                                'task_id'  => $id,
+                                'files'    => array_map(fn($f) => [
+                                    'id'        => (int)$f['id'],
+                                    'fileid'    => (int)$f['fileid'],
+                                    'filename'  => $f['filename'],
+                                    'filepath'  => $f['filepath'],
+                                    'filesize'  => (int)$f['filesize'],
+                                    'protected' => $this->isProtected($f, $rules),
+                                ], $files),
+                            ];
+                            continue; // skip to next group
+                        }
+                    }
+
+                    // No conflict: keep largestProt, delete everything else
+                    foreach ($files as $f) {
+                        if ((int)$f['id'] !== (int)$largestProt['id']) {
+                            $toDelete[] = $f;
+                        }
+                    }
+
+                } elseif (empty($protected)) {
+                    // Rule 1: All-unprotected group → keep LARGEST, delete rest
+                    $sortedUnprot = $unprotected;
+                    usort($sortedUnprot, fn($a, $b) => (int)$b['filesize'] - (int)$a['filesize']);
+                    $toDelete = array_slice($sortedUnprot, 1);
+
                 } else {
-                    foreach (array_slice($protected, 1) as $f) $toDelete[] = $f;
+                    // Rule 2: Mixed group → delete ALL unprotected, keep ALL protected
+                    $toDelete = $unprotected;
                 }
             }
 
-            // FINAL SAFETY GATE: never delete protected unless user opted in
+            // FINAL SAFETY GATE: never delete protected files unless user opted in
             $toDelete = array_values(array_filter($toDelete, function($f) use ($rules, $groupOptedIn) {
                 if (!$this->isProtected($f, $rules)) return true;
                 return $groupOptedIn;
@@ -478,7 +573,14 @@ class TaskController extends Controller {
                         [$id, $gid, $file['filepath'].'/'.$file['filename'], $file['filesize'], 'deleted', $this->uid(), 'bulk', time()]
                     );
                     $deleted++;
-                } catch (\Exception $e) { $skipped++; }
+                } catch (\Exception $e) {
+                    $skipped++;
+                    \OC::$server->getLogger()->error(
+                        '[urbanduplicati] bulkDelete failed for file ' . $file['fileid'] .
+                        ' (' . $file['filepath'] . '/' . $file['filename'] . '): ' . $e->getMessage(),
+                        ['app' => 'urbanduplicati']
+                    );
+                }
             }
 
             // Clean up group if ≤1 file remains
@@ -492,7 +594,7 @@ class TaskController extends Controller {
             }
         }
 
-        return new JSONResponse(['success' => true, 'deleted' => $deleted, 'skipped' => $skipped]);
+        return new JSONResponse(['success' => true, 'deleted' => $deleted, 'skipped' => $skipped, 'conflicts' => $conflicts]);
         } catch (\Exception $e) {
             return new JSONResponse(['error' => $e->getMessage()], 500);
         }
